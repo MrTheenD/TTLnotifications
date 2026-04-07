@@ -47,7 +47,7 @@ def load_data() -> dict:
         except Exception:
             pass
     # live_status tracks whether each account was live on the last check
-    return {"chat_ids": [], "accounts": [], "live_status": {}}
+    return {"chat_ids": [], "accounts": [], "live_status": {}, "live_started": {}}
 
 def save_data(data: dict) -> None:
     DATA_FILE.write_text(json.dumps(data, indent=2))
@@ -58,6 +58,19 @@ def escape_md(text: str) -> str:
     """Escape special characters for Telegram MarkdownV2."""
     special = r"\_*[]()~`>#+-=|{}.!"
     return "".join(f"\\{c}" if c in special else c for c in text)
+
+# ─── Duration helper ────────────────────────────────────────────────────────────
+
+def format_duration(seconds: float) -> str:
+    """Convert seconds into a human-readable duration string."""
+    seconds = int(seconds)
+    h, remainder = divmod(seconds, 3600)
+    m, s = divmod(remainder, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 # ─── TikTok live-status check ─────────────────────────────────────────────────
 
@@ -113,6 +126,7 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     data.setdefault("accounts", []).append(raw)
     data.setdefault("live_status", {})[raw] = False
+    data.setdefault("live_started", {})[raw] = None
     save_data(data)
     await update.message.reply_text(
         f"✅ Now monitoring *{escape_md('@' + raw)}* for live streams\\.",
@@ -135,6 +149,7 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     data["accounts"] = [a for a in data["accounts"] if a.lower() != raw]
     data.get("live_status", {}).pop(raw, None)
+    data.get("live_started", {}).pop(raw, None)
     save_data(data)
     await update.message.reply_text(
         f"🗑️ Removed *{escape_md('@' + raw)}* from monitoring\\.",
@@ -175,17 +190,21 @@ async def cmd_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("😴 Nobody on your list is live right now.")
         return
 
-    lines = "\n".join(
-        f"• [{escape_md('@' + u)}](https://www.tiktok.com/@{u}/live)"
-        for u in live_accounts
-    )
+    live_started = data.get("live_started", {})
+    now = time.time()
+    lines = []
+    for u in live_accounts:
+        started = live_started.get(u)
+        duration = f" — {escape_md(format_duration(now - started))}" if started else ""
+        lines.append(f"• [{escape_md('@' + u)}](https://www.tiktok.com/@{u}/live){duration}")
+    lines_text = "\n".join(lines)
     await update.message.reply_text(
-        f"🟢 *Live right now \\({len(live_accounts)}/{len(accounts)}\\):*\n{lines}",
+        f"🟢 *Live right now \\({len(live_accounts)}/{len(accounts)}\\):*\n{lines_text}",
         parse_mode="MarkdownV2",
         disable_web_page_preview=True,
     )
 
-# ─── Background polling loop ──────────────────────────────────────────────────
+# ─── Background polling loop# ─── Background polling loop ──────────────────────────────────────────────────
 
 async def poll_loop(app: Application) -> None:
     log.info("Polling loop started (interval: %ds)", POLL_INTERVAL_SECONDS)
@@ -199,6 +218,7 @@ async def poll_loop(app: Application) -> None:
         if not accounts or not chat_ids:
             continue
 
+        live_started: dict = data.setdefault("live_started", {})
         log.info("Checking %d account(s)…", len(accounts))
         for username in accounts:
             was_live = live_status.get(username, False)
@@ -208,24 +228,32 @@ async def poll_loop(app: Application) -> None:
             if now_live == was_live:
                 continue
 
-            # Update state immediately
+            now = time.time()
             live_status[username] = now_live
-            save_data(data)
 
             profile_url = f"https://www.tiktok.com/@{username}/live"
 
             if now_live:
-                # Went live
+                # Went live — record start time
+                live_started[username] = now
+                save_data(data)
                 msg = (
                     f"🟢 *{escape_md('@' + username)} is LIVE on TikTok\\!*\n"
                     f"[Watch now →]({profile_url})"
                 )
                 log.info("%s went live", username)
             else:
-                # Went offline
-                msg = (
-                    f"🔴 *{escape_md('@' + username)} is no longer live\\.*"
-                )
+                # Went offline — calculate duration
+                started = live_started.pop(username, None)
+                save_data(data)
+                if started:
+                    duration = escape_md(format_duration(now - started))
+                    msg = (
+                        f"🔴 *{escape_md('@' + username)} is no longer live\\.*\n"
+                        f"⏱️ Was live for {duration}"
+                    )
+                else:
+                    msg = f"🔴 *{escape_md('@' + username)} is no longer live\\.*"
                 log.info("%s went offline", username)
 
             for chat_id in chat_ids:
