@@ -2,8 +2,8 @@
 TikTok Live Notifier — Telegram Bot
 ====================================
 Commands:
-  /add @username    — Add a TikTok account to monitor
-  /remove @username — Remove an account from monitoring
+  /add username     — Add a TikTok account to monitor
+  /remove username  — Remove an account from monitoring
   /list             — Show all monitored accounts
   /online           — Show which monitored accounts are live right now
 
@@ -69,10 +69,12 @@ async def is_user_live(session: aiohttp.ClientSession, username: str) -> bool:
     """
     Check if a TikTok user is currently live.
 
-    When a user is NOT live, TikTok redirects /@username/live -> /@username.
-    When they ARE live, the URL stays on /live.
-    We follow redirects and inspect the final URL — much more reliable than
-    scraping HTML content which contains live-related strings even when offline.
+    Strategy:
+    1. If TikTok redirects away from /@username/live -> definitely offline.
+    2. If the URL stays on /live, parse the __NEXT_DATA__ JSON blob TikTok
+       embeds in every page and check if liveRoomUserInfo is actually populated.
+       This avoids false positives caused by live-related strings appearing
+       in regular offline profile pages.
     """
     username = username.lstrip("@").lower()
     url = f"https://www.tiktok.com/@{username}/live"
@@ -85,10 +87,31 @@ async def is_user_live(session: aiohttp.ClientSession, username: str) -> bool:
         ) as resp:
             if resp.status != 200:
                 return False
-            # Final URL after all redirects
+
+            # Gate 1: redirect check — offline users get redirected away from /live
             final_url = str(resp.url).rstrip("/").lower()
-            # If TikTok redirected away from /live, the user is not live
-            return final_url.endswith("/live")
+            if not final_url.endswith("/live"):
+                return False
+
+            # Gate 2: parse __NEXT_DATA__ and verify live room is actually populated
+            text = await resp.text()
+            match = re.search(
+                r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                text,
+                re.DOTALL,
+            )
+            if not match:
+                return False
+
+            try:
+                next_data = json.loads(match.group(1))
+                page_props = next_data.get("props", {}).get("pageProps", {})
+                live_room_info = page_props.get("liveRoomUserInfo")
+                # Only True if liveRoomUserInfo exists AND is non-empty
+                return bool(live_room_info)
+            except (json.JSONDecodeError, AttributeError, KeyError):
+                return False
+
     except Exception as e:
         log.warning("Error checking %s: %s", username, e)
         return False
@@ -105,8 +128,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 *TikTok Live Notifier*\n\n"
         "I'll ping you whenever a TikTok account you follow goes live.\n\n"
         "Commands:\n"
-        "• /add @username — start monitoring an account\n"
-        "• /remove @username — stop monitoring\n"
+        "• /add username — start monitoring an account\n"
+        "• /remove username — stop monitoring\n"
         "• /list — see all monitored accounts\n"
         "• /online — check who's live right now",
         parse_mode="Markdown",
@@ -122,7 +145,7 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     args = ctx.args
     if not args:
-        await update.message.reply_text("Usage: /add @username")
+        await update.message.reply_text("Usage: /add username")
         return
 
     raw = args[0].lstrip("@").lower()
@@ -144,7 +167,7 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     data = load_data()
     args = ctx.args
     if not args:
-        await update.message.reply_text("Usage: /remove @username")
+        await update.message.reply_text("Usage: /remove username")
         return
 
     raw = args[0].lstrip("@").lower()
@@ -163,7 +186,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     data = load_data()
     accounts = data.get("accounts", [])
     if not accounts:
-        await update.message.reply_text("No accounts monitored yet. Use /add @username to get started.")
+        await update.message.reply_text("No accounts monitored yet. Use /add username to get started.")
         return
     lines = "\n".join(f"• @{a}" for a in accounts)
     await update.message.reply_text(f"📋 *Monitored accounts ({len(accounts)}):*\n{lines}", parse_mode="Markdown")
@@ -172,7 +195,7 @@ async def cmd_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     data = load_data()
     accounts = data.get("accounts", [])
     if not accounts:
-        await update.message.reply_text("No accounts monitored yet. Use /add @username to get started.")
+        await update.message.reply_text("No accounts monitored yet. Use /add username to get started.")
         return
 
     checking_msg = await update.message.reply_text(f"🔍 Checking {len(accounts)} account(s)…")
@@ -252,7 +275,15 @@ async def poll_loop(app: Application) -> None:
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
-    """Launch polling loop as a background task after the bot starts."""
+    """Register bot commands with Telegram and launch the polling loop."""
+    from telegram import BotCommand
+    await app.bot.set_my_commands([
+        BotCommand("start",  "Start the bot"),
+        BotCommand("add",    "Add a TikTok account to monitor"),
+        BotCommand("remove", "Remove a TikTok account"),
+        BotCommand("list",   "List all monitored accounts"),
+        BotCommand("online", "Check who is live right now"),
+    ])
     asyncio.create_task(poll_loop(app))
 
 def main() -> None:
