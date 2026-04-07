@@ -30,8 +30,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN              = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DATA_FILE              = Path("/data/tiktok_bot_data.json")
-POLL_INTERVAL_SECONDS  = 60   # how often to check for live streams
-NOTIFY_COOLDOWN_SECONDS = 300  # don't re-notify same streamer within 5 min
+POLL_INTERVAL_SECONDS  = 60   # how often to check live status
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -47,7 +46,8 @@ def load_data() -> dict:
             return json.loads(DATA_FILE.read_text())
         except Exception:
             pass
-    return {"chat_ids": [], "accounts": [], "last_notified": {}}
+    # live_status tracks whether each account was live on the last check
+    return {"chat_ids": [], "accounts": [], "live_status": {}}
 
 def save_data(data: dict) -> None:
     DATA_FILE.write_text(json.dumps(data, indent=2))
@@ -56,7 +56,6 @@ def save_data(data: dict) -> None:
 
 def escape_md(text: str) -> str:
     """Escape special characters for Telegram MarkdownV2."""
-    # Characters that must be escaped in MarkdownV2
     special = r"\_*[]()~`>#+-=|{}.!"
     return "".join(f"\\{c}" if c in special else c for c in text)
 
@@ -81,7 +80,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         save_data(data)
     await update.message.reply_text(
         "👋 *TikTok Live Notifier*\n\n"
-        "I'll ping you whenever a TikTok account you follow goes live\\.\n\n"
+        "I'll ping you whenever a TikTok account goes live or ends their stream\\.\n\n"
         "Commands:\n"
         "• /add username — start monitoring an account\n"
         "• /remove username — stop monitoring\n"
@@ -103,7 +102,6 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     raw = args[0].lstrip("@").lower()
-    # TikTok usernames: letters, numbers, underscores, periods — max 24 chars
     if not re.match(r"^[a-zA-Z0-9_.]{1,24}$", raw):
         await update.message.reply_text("⚠️ That doesn't look like a valid TikTok username.")
         return
@@ -114,6 +112,7 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     data.setdefault("accounts", []).append(raw)
+    data.setdefault("live_status", {})[raw] = False
     save_data(data)
     await update.message.reply_text(
         f"✅ Now monitoring *{escape_md('@' + raw)}* for live streams\\.",
@@ -135,7 +134,7 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     data["accounts"] = [a for a in data["accounts"] if a.lower() != raw]
-    data.get("last_notified", {}).pop(raw, None)
+    data.get("live_status", {}).pop(raw, None)
     save_data(data)
     await update.message.reply_text(
         f"🗑️ Removed *{escape_md('@' + raw)}* from monitoring\\.",
@@ -149,10 +148,14 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not accounts:
         await update.message.reply_text("No accounts monitored yet. Use /add username to get started.")
         return
-    lines = "\n".join(f"• {escape_md('@' + a)}" for a in accounts)
+    lines = "\n".join(
+        f"• [{escape_md('@' + a)}](https://www.tiktok.com/@{a})"
+        for a in accounts
+    )
     await update.message.reply_text(
         f"📋 *Monitored accounts \\({len(accounts)}\\):*\n{lines}",
         parse_mode="MarkdownV2",
+        disable_web_page_preview=True,
     )
 
 async def cmd_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -177,7 +180,7 @@ async def cmd_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         for u in live_accounts
     )
     await update.message.reply_text(
-        f"🔴 *Live right now \\({len(live_accounts)}/{len(accounts)}\\):*\n{lines}",
+        f"🟢 *Live right now \\({len(live_accounts)}/{len(accounts)}\\):*\n{lines}",
         parse_mode="MarkdownV2",
         disable_web_page_preview=True,
     )
@@ -189,33 +192,42 @@ async def poll_loop(app: Application) -> None:
     while True:
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
         data = load_data()
-        accounts = data.get("accounts", [])
-        chat_ids = data.get("chat_ids", [])
-        last_notified: dict = data.setdefault("last_notified", {})
+        accounts  = data.get("accounts", [])
+        chat_ids  = data.get("chat_ids", [])
+        live_status: dict = data.setdefault("live_status", {})
 
         if not accounts or not chat_ids:
             continue
 
         log.info("Checking %d account(s)…", len(accounts))
         for username in accounts:
-            live = await is_user_live(username)
-            if not live:
+            was_live = live_status.get(username, False)
+            now_live = await is_user_live(username)
+
+            # No change — skip
+            if now_live == was_live:
                 continue
 
-            now = time.time()
-            last = last_notified.get(username, 0)
-            if now - last < NOTIFY_COOLDOWN_SECONDS:
-                log.info("%s is live but cooldown active, skipping notify.", username)
-                continue
-
-            last_notified[username] = now
+            # Update state immediately
+            live_status[username] = now_live
             save_data(data)
 
             profile_url = f"https://www.tiktok.com/@{username}/live"
-            msg = (
-                f"🔴 *{escape_md('@' + username)} is LIVE on TikTok\\!*\n"
-                f"[Watch now →]({profile_url})"
-            )
+
+            if now_live:
+                # Went live
+                msg = (
+                    f"🟢 *{escape_md('@' + username)} is LIVE on TikTok\\!*\n"
+                    f"[Watch now →]({profile_url})"
+                )
+                log.info("%s went live", username)
+            else:
+                # Went offline
+                msg = (
+                    f"🔴 *{escape_md('@' + username)} is no longer live\\.*"
+                )
+                log.info("%s went offline", username)
+
             for chat_id in chat_ids:
                 try:
                     await app.bot.send_message(
@@ -224,7 +236,6 @@ async def poll_loop(app: Application) -> None:
                         parse_mode="MarkdownV2",
                         disable_web_page_preview=False,
                     )
-                    log.info("Notified chat %s: %s is live", chat_id, username)
                 except Exception as e:
                     log.warning("Failed to notify chat %s: %s", chat_id, e)
 
