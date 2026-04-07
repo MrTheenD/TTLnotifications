@@ -191,6 +191,14 @@ async def poll_loop(app: Application) -> None:
             if not live:
                 continue
 
+            # Double-check after 10 seconds to filter out false positives
+            log.info("%s appears live, verifying in 10s…", username)
+            await asyncio.sleep(10)
+            live = await is_user_live(username)
+            if not live:
+                log.info("%s was a false positive, skipping.", username)
+                continue
+
             now = time.time()
             last = last_notified.get(username, 0)
             if now - last < NOTIFY_COOLDOWN_SECONDS:
