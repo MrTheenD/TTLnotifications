@@ -74,14 +74,45 @@ def format_duration(seconds: float) -> str:
 
 # ─── TikTok live-status check ─────────────────────────────────────────────────
 
-async def is_user_live(username: str) -> bool:
-    """Check if a TikTok user is currently live using the TikTokLive library."""
+async def is_user_live(username: str) -> tuple[bool, str]:
+    """Check if a TikTok user is currently live and extract the .flv stream URL."""
     try:
         client = TikTokLiveClient(unique_id=username)
-        return await client.is_live()
+        is_live = await client.is_live()
+        flv_url = ""
+        
+        if is_live:
+            try:
+                room_info = await client.web.fetch_room_info(unique_id=username)
+                
+                # Navigate through the room info dictionary to find the raw stream config
+                stream_url_data = room_info.get("data", {}).get("stream_url", {})
+                live_core = stream_url_data.get("live_core_sdk_data", {})
+                pull_data = live_core.get("pull_data", {})
+                stream_data_str = pull_data.get("stream_data", "{}")
+                
+                if stream_data_str:
+                    stream_data = json.loads(stream_data_str)
+                    data_node = stream_data.get("data", {})
+                    
+                    # Prioritize highest quality to lowest
+                    for quality in ["origin", "hd", "sd", "ld"]:
+                        if quality in data_node and "main" in data_node[quality]:
+                            url = data_node[quality]["main"].get("flv")
+                            if url:
+                                flv_url = url
+                                break
+                    
+                    if flv_url:
+                        # Strip out the audio-only restriction flags
+                        flv_url = flv_url.replace("&only_audio=1\\", "").replace("&only_audio=1", "")
+            except Exception as inner_e:
+                log.warning("Failed to extract FLV for %s: %s", username, inner_e)
+
+        return is_live, flv_url
     except Exception as e:
         log.warning("Error checking %s: %s", username, e)
-        return False
+        return False, ""
 
 # ─── Telegram command handlers ────────────────────────────────────────────────
 
@@ -182,29 +213,33 @@ async def cmd_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     checking_msg = await update.message.reply_text(f"🔍 Checking {len(accounts)} account(s)…")
     results = await asyncio.gather(*[is_user_live(u) for u in accounts])
-    live_accounts = [u for u, live in zip(accounts, results) if live]
+    live_data = [(u, flv) for u, (is_live, flv) in zip(accounts, results) if is_live]
 
     await checking_msg.delete()
 
-    if not live_accounts:
+    if not live_data:
         await update.message.reply_text("😴 Nobody on your list is live right now.")
         return
 
     live_started = data.get("live_started", {})
     now = time.time()
     lines = []
-    for u in live_accounts:
+    
+    for u, flv_url in live_data:
         started = live_started.get(u)
         duration = f" — {escape_md(format_duration(now - started))}" if started else ""
         lines.append(f"• [{escape_md('@' + u)}](https://www.tiktok.com/@{u}/live){duration}")
+        if flv_url:
+            lines.append(f"  └ 📥 [{escape_md('Download Stream (.flv)')}]({flv_url})")
+            
     lines_text = "\n".join(lines)
     await update.message.reply_text(
-        f"🟢 *Live right now \\({len(live_accounts)}/{len(accounts)}\\):*\n{lines_text}",
+        f"🟢 *Live right now \\({len(live_data)}/{len(accounts)}\\):*\n{lines_text}",
         parse_mode="MarkdownV2",
         disable_web_page_preview=True,
     )
 
-# ─── Background polling loop# ─── Background polling loop ──────────────────────────────────────────────────
+# ─── Background polling loop ──────────────────────────────────────────────────
 
 async def poll_loop(app: Application) -> None:
     log.info("Polling loop started (interval: %ds)", POLL_INTERVAL_SECONDS)
@@ -222,7 +257,7 @@ async def poll_loop(app: Application) -> None:
         log.info("Checking %d account(s)…", len(accounts))
         for username in accounts:
             was_live = live_status.get(username, False)
-            now_live = await is_user_live(username)
+            now_live, flv_url = await is_user_live(username)
 
             # No change — skip
             if now_live == was_live:
@@ -237,9 +272,12 @@ async def poll_loop(app: Application) -> None:
                 # Went live — record start time
                 live_started[username] = now
                 save_data(data)
+                
+                dl_link = f"\n📥 [{escape_md('Download Stream (.flv)')}]({flv_url})" if flv_url else ""
+                
                 msg = (
                     f"🟢 *{escape_md('@' + username)} is LIVE on TikTok\\!*\n"
-                    f"[Watch now →]({profile_url})"
+                    f"[Watch now →]({profile_url}){dl_link}"
                 )
                 log.info("%s went live", username)
             else:
@@ -262,7 +300,7 @@ async def poll_loop(app: Application) -> None:
                         chat_id=chat_id,
                         text=msg,
                         parse_mode="MarkdownV2",
-                        disable_web_page_preview=False,
+                        disable_web_page_preview=True, 
                     )
                 except Exception as e:
                     log.warning("Failed to notify chat %s: %s", chat_id, e)
