@@ -29,7 +29,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-DATA_FILE   = Path("tiktok_bot_data.json")
+DATA_FILE   = Path("/data/tiktok_bot_data.json")
 POLL_INTERVAL_SECONDS = 60          # how often to check for live streams
 NOTIFY_COOLDOWN_SECONDS = 300       # don't re-notify for the same streamer within 5 min
 
@@ -68,10 +68,13 @@ HEADERS = {
 async def is_user_live(session: aiohttp.ClientSession, username: str) -> bool:
     """
     Check if a TikTok user is currently live.
-    Uses the public /live page — no auth required.
-    Returns True if live, False otherwise.
+
+    When a user is NOT live, TikTok redirects /@username/live -> /@username.
+    When they ARE live, the URL stays on /live.
+    We follow redirects and inspect the final URL — much more reliable than
+    scraping HTML content which contains live-related strings even when offline.
     """
-    username = username.lstrip("@")
+    username = username.lstrip("@").lower()
     url = f"https://www.tiktok.com/@{username}/live"
     try:
         async with session.get(
@@ -82,15 +85,10 @@ async def is_user_live(session: aiohttp.ClientSession, username: str) -> bool:
         ) as resp:
             if resp.status != 200:
                 return False
-            text = await resp.text()
-            # If TikTok redirects to the profile instead of a live room, the user is offline.
-            # When live, the page contains a room_id or "liveRoomUserInfo" in the NEXT_DATA blob.
-            is_live = (
-                '"liveRoomUserInfo"' in text
-                or '"roomId"' in text
-                or '"LiveRoom"' in text
-            )
-            return is_live
+            # Final URL after all redirects
+            final_url = str(resp.url).rstrip("/").lower()
+            # If TikTok redirected away from /live, the user is not live
+            return final_url.endswith("/live")
     except Exception as e:
         log.warning("Error checking %s: %s", username, e)
         return False
