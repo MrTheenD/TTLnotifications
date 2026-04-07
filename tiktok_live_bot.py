@@ -56,10 +56,20 @@ def save_data(data: dict) -> None:
 # ─── TikTok live-status check ─────────────────────────────────────────────────
 
 async def is_user_live(username: str) -> bool:
-    """Check if a TikTok user is currently live using the TikTokLive library."""
+    """
+    Check if a TikTok user is live.
+    Requires 3 consecutive positive results spaced 15 seconds apart
+    before returning True, to eliminate false positives.
+    """
     try:
         client = TikTokLiveClient(unique_id=username)
-        return await client.is_live()
+        for attempt in range(3):
+            if attempt > 0:
+                await asyncio.sleep(15)
+            result = await client.is_live()
+            if not result:
+                return False  # Any negative cancels immediately
+        return True           # All 3 confirmed live
     except Exception as e:
         log.warning("Error checking %s: %s", username, e)
         return False
@@ -189,14 +199,6 @@ async def poll_loop(app: Application) -> None:
         for username in accounts:
             live = await is_user_live(username)
             if not live:
-                continue
-
-            # Double-check after 10 seconds to filter out false positives
-            log.info("%s appears live, verifying in 10s…", username)
-            await asyncio.sleep(10)
-            live = await is_user_live(username)
-            if not live:
-                log.info("%s was a false positive, skipping.", username)
                 continue
 
             now = time.time()
