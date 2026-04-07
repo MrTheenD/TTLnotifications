@@ -5,6 +5,7 @@ Commands:
   /add @username    — Add a TikTok account to monitor
   /remove @username — Remove an account from monitoring
   /list             — Show all monitored accounts
+  /online           — Show which monitored accounts are live right now
 
 Setup:
   pip install python-telegram-bot==20.* aiohttp aiofiles
@@ -108,7 +109,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Commands:\n"
         "• /add @username — start monitoring an account\n"
         "• /remove @username — stop monitoring\n"
-        "• /list — see all monitored accounts",
+        "• /list — see all monitored accounts\n"
+        "• /online — check who's live right now",
         parse_mode="Markdown",
     )
 
@@ -167,6 +169,38 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     lines = "\n".join(f"• @{a}" for a in accounts)
     await update.message.reply_text(f"📋 *Monitored accounts ({len(accounts)}):*\n{lines}", parse_mode="Markdown")
+
+async def cmd_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    data = load_data()
+    accounts = data.get("accounts", [])
+    if not accounts:
+        await update.message.reply_text("No accounts monitored yet. Use /add @username to get started.")
+        return
+
+    checking_msg = await update.message.reply_text(f"🔍 Checking {len(accounts)} account(s)…")
+
+    live_accounts = []
+    async with aiohttp.ClientSession() as session:
+        results = await asyncio.gather(*[is_user_live(session, u) for u in accounts])
+
+    for username, live in zip(accounts, results):
+        if live:
+            live_accounts.append(username)
+
+    await checking_msg.delete()
+
+    if not live_accounts:
+        await update.message.reply_text("😴 Nobody on your list is live right now.")
+        return
+
+    lines = "\n".join(
+        f"• [@{u}](https://www.tiktok.com/@{u}/live)" for u in live_accounts
+    )
+    await update.message.reply_text(
+        f"🔴 *Live right now ({len(live_accounts)}/{len(accounts)}):*\n{lines}",
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
 
 # ─── Background polling loop ──────────────────────────────────────────────────
 
@@ -239,6 +273,7 @@ def main() -> None:
     app.add_handler(CommandHandler("add",    cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list",   cmd_list))
+    app.add_handler(CommandHandler("online", cmd_online))
 
     log.info("Bot is running…")
     app.run_polling(drop_pending_updates=True)
