@@ -1,0 +1,1 @@
+worker: python tiktok_live_bot.py
