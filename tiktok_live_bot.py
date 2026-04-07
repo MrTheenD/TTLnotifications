@@ -8,7 +8,7 @@ Commands:
   /online           — Show which monitored accounts are live right now
 
 Setup:
-  pip install python-telegram-bot==20.* aiohttp aiofiles
+  pip install python-telegram-bot==20.* TikTokLive
 
 Run:
   BOT_TOKEN=your_token python tiktok_live_bot.py
@@ -22,7 +22,7 @@ import re
 import time
 from pathlib import Path
 
-import aiohttp
+from TikTokLive import TikTokLiveClient
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -55,63 +55,11 @@ def save_data(data: dict) -> None:
 
 # ─── TikTok live-status check ─────────────────────────────────────────────────
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.tiktok.com/",
-}
-
-async def is_user_live(session: aiohttp.ClientSession, username: str) -> bool:
-    """
-    Check if a TikTok user is currently live.
-
-    Strategy:
-    1. If TikTok redirects away from /@username/live -> definitely offline.
-    2. If the URL stays on /live, parse the __NEXT_DATA__ JSON blob TikTok
-       embeds in every page and check if liveRoomUserInfo is actually populated.
-       This avoids false positives caused by live-related strings appearing
-       in regular offline profile pages.
-    """
-    username = username.lstrip("@").lower()
-    url = f"https://www.tiktok.com/@{username}/live"
+async def is_user_live(username: str) -> bool:
+    """Check if a TikTok user is currently live using the TikTokLive library."""
     try:
-        async with session.get(
-            url,
-            headers=HEADERS,
-            allow_redirects=True,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status != 200:
-                return False
-
-            # Gate 1: redirect check — offline users get redirected away from /live
-            final_url = str(resp.url).rstrip("/").lower()
-            if not final_url.endswith("/live"):
-                return False
-
-            # Gate 2: parse __NEXT_DATA__ and verify live room is actually populated
-            text = await resp.text()
-            match = re.search(
-                r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-                text,
-                re.DOTALL,
-            )
-            if not match:
-                return False
-
-            try:
-                next_data = json.loads(match.group(1))
-                page_props = next_data.get("props", {}).get("pageProps", {})
-                live_room_info = page_props.get("liveRoomUserInfo")
-                # Only True if liveRoomUserInfo exists AND is non-empty
-                return bool(live_room_info)
-            except (json.JSONDecodeError, AttributeError, KeyError):
-                return False
-
+        client = TikTokLiveClient(unique_id=username)
+        return await client.is_live()
     except Exception as e:
         log.warning("Error checking %s: %s", username, e)
         return False
@@ -201,8 +149,7 @@ async def cmd_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     checking_msg = await update.message.reply_text(f"🔍 Checking {len(accounts)} account(s)…")
 
     live_accounts = []
-    async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(*[is_user_live(session, u) for u in accounts])
+    results = await asyncio.gather(*[is_user_live(u) for u in accounts])
 
     for username, live in zip(accounts, results):
         if live:
@@ -228,49 +175,48 @@ async def cmd_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def poll_loop(app: Application) -> None:
     """Continuously poll TikTok for live streams and send Telegram notifications."""
     log.info("Polling loop started (interval: %ds)", POLL_INTERVAL_SECONDS)
-    async with aiohttp.ClientSession() as session:
-        while True:
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
-            data = load_data()
-            accounts = data.get("accounts", [])
-            chat_ids = data.get("chat_ids", [])
-            last_notified: dict = data.setdefault("last_notified", {})
+    while True:
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        data = load_data()
+        accounts = data.get("accounts", [])
+        chat_ids = data.get("chat_ids", [])
+        last_notified: dict = data.setdefault("last_notified", {})
 
-            if not accounts or not chat_ids:
+        if not accounts or not chat_ids:
+            continue
+
+        log.info("Checking %d account(s)…", len(accounts))
+        for username in accounts:
+            live = await is_user_live(username)
+            if not live:
                 continue
 
-            log.info("Checking %d account(s)…", len(accounts))
-            for username in accounts:
-                live = await is_user_live(session, username)
-                if not live:
-                    continue
+            now = time.time()
+            last = last_notified.get(username, 0)
+            if now - last < NOTIFY_COOLDOWN_SECONDS:
+                log.info("%s is live but cooldown active, skipping notify.", username)
+                continue
 
-                now = time.time()
-                last = last_notified.get(username, 0)
-                if now - last < NOTIFY_COOLDOWN_SECONDS:
-                    log.info("%s is live but cooldown active, skipping notify.", username)
-                    continue
+            # Update cooldown timestamp before sending
+            last_notified[username] = now
+            save_data(data)
 
-                # Update cooldown timestamp before sending
-                last_notified[username] = now
-                save_data(data)
-
-                profile_url = f"https://www.tiktok.com/@{username}/live"
-                msg = (
-                    f"🔴 *@{username} is LIVE on TikTok!*\n"
-                    f"[Watch now →]({profile_url})"
-                )
-                for chat_id in chat_ids:
-                    try:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=msg,
-                            parse_mode="Markdown",
-                            disable_web_page_preview=False,
-                        )
-                        log.info("Notified chat %s: %s is live", chat_id, username)
-                    except Exception as e:
-                        log.warning("Failed to notify chat %s: %s", chat_id, e)
+            profile_url = f"https://www.tiktok.com/@{username}/live"
+            msg = (
+                f"🔴 *@{username} is LIVE on TikTok!*\n"
+                f"[Watch now →]({profile_url})"
+            )
+            for chat_id in chat_ids:
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=msg,
+                        parse_mode="Markdown",
+                        disable_web_page_preview=False,
+                    )
+                    log.info("Notified chat %s: %s is live", chat_id, username)
+                except Exception as e:
+                    log.warning("Failed to notify chat %s: %s", chat_id, e)
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
